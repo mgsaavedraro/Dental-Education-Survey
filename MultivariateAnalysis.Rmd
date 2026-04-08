@@ -1,0 +1,2271 @@
+---
+title: "Univariate and Multivariate Analysis of Dental Education Survey"
+author: "M Sc. Gregorio"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, knitr.kable.NA = "")
+# ---- setup: repos + paquetes ----
+# Define CRAN al knit (no interactivo)
+if (is.null(getOption("repos")) || getOption("repos")["CRAN"] %in% c("@CRAN@", NA)) {
+  options(repos = c(CRAN = "https://cran.rstudio.com/"))
+}
+```
+
+```{r}
+# ============================================================
+# 0) Packages
+# ============================================================
+pkgs <- c(
+  "readxl", "dplyr", "tidyr", "purrr", "stringr", "janitor",
+  "knitr", "tibble"
+)
+
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install)
+
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+
+```{r}
+# ============================================================
+# Cargar la base de datos desde el archivo RDS
+# ============================================================
+# Ruta donde se guarda el archivo RDS
+data_path <- "Data/survey_db.rds"
+
+# Cargar el archivo RDS
+survey_db <- readRDS(file = data_path)
+
+# Verificar si se cargó correctamente
+str(survey_db)  # Esto mostrará la estructura del objeto cargado
+
+# ============================================================
+# Cargar la base de datos desde el archivo RDS
+# ============================================================
+# Ruta donde se guarda el archivo RDS
+data_path <- "Data/db_by_instrument.rds"
+
+# Cargar el archivo RDS
+db_by_instrument <- readRDS(file = data_path)
+
+# Verificar si se cargó correctamente
+str(db_by_instrument)  # Esto mostrará la estructura del objeto cargado
+```
+
+```{r}
+# ============================================================
+# SECTION 0) Helpers (Mode & IQR + safe item selection)
+# ============================================================
+mode_numeric <- function(x) {
+  x <- suppressWarnings(as.numeric(as.character(x)))
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+iqr_numeric <- function(x) {
+  x <- suppressWarnings(as.numeric(as.character(x)))
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  IQR(x)
+}
+
+# Given a dataframe and a segment map (named by cleaned column names),
+# return ONLY item columns to analyze, excluding:
+# - col1 (id) and col2 (DS) ALWAYS
+# - respondent_group and instrument ALWAYS
+# - any explicitly excluded columns you pass (optional)
+get_item_columns <- function(df, seg_map, extra_exclude = character()) {
+  stopifnot(ncol(df) >= 2)
+
+  col1 <- names(df)[1]
+  col2 <- names(df)[2]
+
+  exclude <- unique(c(col1, col2, "respondent_group", "instrument", extra_exclude))
+  exclude <- exclude[exclude %in% names(df)]
+
+  item_cols <- setdiff(names(df), exclude)
+
+  # Keep only those that have a meaningful segment label
+  seg_item <- seg_map[item_cols]
+  keep <- !is.na(seg_item) &
+    stringr::str_trim(seg_item) != "" &
+    stringr::str_trim(seg_item) != "Unsegmented"
+
+  item_cols[keep]
+}
+
+# ============================================================
+# SECTION 1) Build ONE long dataset (from survey_db) with:
+#   ds, respondent_group, instrument, segment, item, item_label, value
+# Notes:
+# - ds is taken from column 2 (always DS)
+# - excludes col1=id, col2=DS from item list automatically
+# - excludes respondent_group + instrument from item list automatically
+# ============================================================
+build_long_all <- function(survey_db) {
+
+  one_sheet_to_long <- function(sheet_obj) {
+    df        <- sheet_obj$data
+    seg_map   <- sheet_obj$seg_map
+    label_map <- sheet_obj$label_map
+
+    stopifnot(ncol(df) >= 2)
+
+    id_col <- names(df)[1]
+    ds_col <- names(df)[2]
+
+    item_cols <- get_item_columns(df, seg_map)
+
+    if (length(item_cols) == 0) {
+      return(tibble::tibble(
+        ds = character(),
+        respondent_group = character(),
+        instrument = character(),
+        segment = character(),
+        item = character(),
+        item_label = character(),
+        value = numeric()
+      ))
+    }
+
+    seg_item   <- seg_map[item_cols]
+    label_item <- label_map[item_cols]
+
+    df %>%
+      dplyr::mutate(
+        id = .data[[id_col]],
+        ds = .data[[ds_col]]
+      ) %>%
+      dplyr::select(dplyr::all_of(c("ds", "respondent_group", "instrument", item_cols))) %>%
+      tidyr::pivot_longer(
+        cols      = dplyr::all_of(item_cols),
+        names_to  = "item",
+        values_to = "value"
+      ) %>%
+      dplyr::mutate(
+        segment    = unname(seg_item[item]),
+        item_label = unname(label_item[item]),
+        value      = suppressWarnings(as.numeric(as.character(value)))
+      ) %>%
+      dplyr::filter(!is.na(segment))
+  }
+
+  purrr::map_dfr(survey_db, one_sheet_to_long) %>%
+    dplyr::filter(
+      !is.na(ds), ds != "",
+      respondent_group %in% c("Students", "Educators"),
+      instrument %in% c("CCI", "HxC", "TEI")
+    )
+}
+
+# Build it (uses your existing survey_db from earlier)
+all_long <- build_long_all(survey_db)
+
+# Optional quick sanity checks
+dplyr::count(all_long, instrument, respondent_group)
+dplyr::count(all_long, ds, instrument)
+
+# ============================================================
+# SECTION 2) MODE & IQR by DS x Respondent_group x Instrument x Segment
+# (This is the "by segment" summary, not item-level)
+# ============================================================
+mode_iqr_by_ds_resp_instr_segment <- all_long %>%
+  dplyr::group_by(ds, respondent_group, instrument, segment, .drop = TRUE) %>%
+  dplyr::summarise(
+    n_nonmiss = sum(!is.na(value)),
+    mode      = mode_numeric(value),
+    iqr       = iqr_numeric(value),
+    .groups   = "drop"
+  ) %>%
+  dplyr::arrange(instrument, ds, respondent_group, segment)
+
+knitr::kable(
+  mode_iqr_by_ds_resp_instr_segment,
+  caption = "Mode & IQR by DS × Respondent group × Instrument, grouped by Segment",
+  digits  = 2
+)
+
+# ============================================================
+# SECTION 3) MODE & IQR by DS x Respondent_group x Instrument x Segment x Item
+# (This is the item/column-level summary you requested)
+# ============================================================
+mode_iqr_by_ds_resp_instr_segment_item <- all_long %>%
+  dplyr::group_by(ds, respondent_group, instrument, segment, item, item_label, .drop = TRUE) %>%
+  dplyr::summarise(
+    n_nonmiss = sum(!is.na(value)),
+    mode      = mode_numeric(value),
+    iqr       = iqr_numeric(value),
+    .groups   = "drop"
+  ) %>%
+  dplyr::arrange(instrument, ds, respondent_group, segment, item_label)
+
+knitr::kable(
+  mode_iqr_by_ds_resp_instr_segment_item,
+  caption = "Mode & IQR by DS × Respondent group × Instrument × Segment × Item",
+  digits  = 2
+)
+
+# ============================================================
+# SECTION 4) "All combinations" (optional): a small function
+# that lets you compute Mode & IQR for ANY grouping subset.
+#
+# Examples:
+#   - by instrument + segment
+#   - by ds + instrument + item
+#   - by respondent_group + segment + item
+# ============================================================
+mode_iqr_any_grouping <- function(long_df,
+                                 group_vars = c("instrument", "segment"),
+                                 include_item = FALSE) {
+
+  needed <- c("ds","respondent_group","instrument","segment","item","item_label","value")
+  stopifnot(all(group_vars %in% needed))
+  stopifnot(all(needed %in% names(long_df)))
+
+  if (include_item) {
+    group_vars <- unique(c(group_vars, "item", "item_label"))
+  }
+
+  long_df %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars)), .drop = TRUE) %>%
+    dplyr::summarise(
+      n_nonmiss = sum(!is.na(value)),
+      mode      = mode_numeric(value),
+      iqr       = iqr_numeric(value),
+      .groups   = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::across(dplyr::all_of(group_vars)))
+}
+
+# ---- EXAMPLES of "all combinations" you might want ----
+
+# A) By instrument x segment (collapsed across DS and respondent group)
+ex_instr_segment <- mode_iqr_any_grouping(all_long, c("instrument","segment"), include_item = FALSE)
+
+# B) By instrument x segment x item
+ex_instr_segment_item <- mode_iqr_any_grouping(all_long, c("instrument","segment"), include_item = TRUE)
+
+# C) By DS x instrument x segment
+ex_ds_instr_segment <- mode_iqr_any_grouping(all_long, c("ds","instrument","segment"), include_item = FALSE)
+
+# D) By DS x instrument x segment x item
+ex_ds_instr_segment_item <- mode_iqr_any_grouping(all_long, c("ds","instrument","segment"), include_item = TRUE)
+
+# E) By respondent_group x instrument x segment
+ex_resp_instr_segment <- mode_iqr_any_grouping(all_long, c("respondent_group","instrument","segment"), include_item = FALSE)
+
+# Print any example
+knitr::kable(ex_resp_instr_segment, caption = "Example: Mode & IQR by Respondent × Instrument x Segment", digits = 2)
+
+# Print any example
+knitr::kable(ex_instr_segment, caption = "Example: Mode & IQR by Instrument × Segment", digits = 2)
+```
+
+```{r}
+# ============================================================
+# REAL Cronbach's alpha from survey_db (wide respondent x item)
+# ============================================================
+
+pkgs <- c("dplyr","purrr","stringr","tibble","psych")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if(length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# ------------------------------------------------------------
+# Helper: safe psych alpha on a respondent x item matrix
+# ------------------------------------------------------------
+cronbach_psych_safe <- function(mat, n_min = 10) {
+  mat <- as.data.frame(mat)
+
+  # numeric coercion
+  mat <- mat %>% mutate(across(everything(), ~ suppressWarnings(as.numeric(as.character(.x)))))
+
+  # drop all-NA cols
+  mat <- mat[, colSums(!is.na(mat)) > 0, drop = FALSE]
+
+  k0 <- ncol(mat)
+  if (k0 < 2) {
+    return(tibble(
+      n_complete = sum(complete.cases(mat)),
+      k_items = k0,
+      dropped_zero_var = 0L,
+      alpha = NA_real_,
+      note = "Alpha undefined: <2 items in segment."
+    ))
+  }
+
+  # listwise complete cases (standard for alpha)
+  mat_cc <- mat[complete.cases(mat), , drop = FALSE]
+  n_cc <- nrow(mat_cc)
+
+  if (n_cc < n_min) {
+    return(tibble(
+      n_complete = n_cc,
+      k_items = k0,
+      dropped_zero_var = 0L,
+      alpha = NA_real_,
+      note = paste0("Too few complete cases (n<", n_min, ").")
+    ))
+  }
+
+  # drop zero-variance items (alpha becomes unstable / fails)
+  v <- vapply(mat_cc, var, numeric(1), na.rm = TRUE)
+  keep <- names(v)[is.finite(v) & v > 0]
+  dropped <- k0 - length(keep)
+  mat_cc <- mat_cc[, keep, drop = FALSE]
+
+  if (ncol(mat_cc) < 2) {
+    return(tibble(
+      n_complete = n_cc,
+      k_items = ncol(mat_cc),
+      dropped_zero_var = dropped,
+      alpha = NA_real_,
+      note = "After removing zero-variance items, <2 items remain."
+    ))
+  }
+
+  a <- tryCatch(
+    psych::alpha(mat_cc, check.keys = FALSE, warnings = FALSE),
+    error = function(e) NULL
+  )
+
+  if (is.null(a)) {
+    return(tibble(
+      n_complete = n_cc,
+      k_items = ncol(mat_cc),
+      dropped_zero_var = dropped,
+      alpha = NA_real_,
+      note = "psych::alpha failed."
+    ))
+  }
+
+  tibble(
+    n_complete = a$n.obs,
+    k_items = a$nvar,
+    dropped_zero_var = dropped,
+    alpha = unname(a$total$raw_alpha),
+    note = "OK"
+  )
+}
+
+# ------------------------------------------------------------
+# Main: compute alpha by SEGMENT, and optionally by DS
+# Uses:
+#  - respondent id = col 1 (as in your sheets)
+#  - ds            = col 2
+#  - items         = all other columns except respondent_group/instrument
+#  - segment labels come from sheet_obj$seg_map
+# ------------------------------------------------------------
+alpha_by_segment_from_survey_db <- function(survey_db,
+                                           by_ds = FALSE,
+                                           n_min = 10) {
+
+  one_sheet <- function(sheet_obj) {
+    df <- sheet_obj$data
+    seg_map <- sheet_obj$seg_map
+    meta <- sheet_obj$meta
+
+    # identify columns
+    id_col <- names(df)[1]
+    ds_col <- names(df)[2]
+
+    # item columns are those in seg_map excluding id/ds/provenance
+    exclude <- c(id_col, ds_col, "respondent_group", "instrument")
+    item_cols <- setdiff(names(df), exclude)
+
+    # Keep only segmented items (not Unsegmented)
+    seg_for_item <- seg_map[item_cols]
+    keep_items <- !is.na(seg_for_item) & stringr::str_trim(seg_for_item) != "" &
+      stringr::str_trim(seg_for_item) != "Unsegmented"
+    item_cols <- item_cols[keep_items]
+    seg_for_item <- seg_for_item[keep_items]
+
+    if (length(item_cols) == 0) return(tibble())
+
+    # Build a long table of (item -> segment)
+    item_seg_tbl <- tibble(item = item_cols, segment = unname(seg_for_item))
+
+    # Base respondent table
+    base <- df %>%
+      transmute(
+        respondent_id = .data[[id_col]],
+        ds = .data[[ds_col]],
+        respondent_group = .data[["respondent_group"]],
+        instrument = .data[["instrument"]]
+      )
+
+    # Merge items back (wide stays wide, preserving respondent_id)
+    wide_items <- df %>%
+      select(all_of(c(id_col, ds_col, item_cols))) %>%
+      rename(respondent_id = all_of(id_col),
+             ds = all_of(ds_col))
+
+    # now compute alpha per segment
+    segments <- unique(item_seg_tbl$segment)
+
+    purrr::map_dfr(segments, function(seg) {
+      seg_items <- item_seg_tbl %>% filter(segment == seg) %>% pull(item)
+
+      if (!by_ds) {
+        mat <- wide_items %>% select(all_of(seg_items))
+        out <- cronbach_psych_safe(mat, n_min = n_min)
+        out %>% mutate(
+          respondent_group = unique(base$respondent_group),
+          instrument = unique(base$instrument),
+          segment = seg,
+          ds = NA_character_
+        )
+      } else {
+        # by DS: split wide_items by ds and compute alpha in each DS
+        wide_items %>%
+          group_by(ds) %>%
+          group_modify(~{
+            mat <- .x %>% select(all_of(seg_items))
+            cronbach_psych_safe(mat, n_min = n_min)
+          }) %>%
+          ungroup() %>%
+          mutate(
+            respondent_group = unique(base$respondent_group),
+            instrument = unique(base$instrument),
+            segment = seg
+          )
+      }
+    })
+  }
+
+  purrr::map_dfr(survey_db, one_sheet) %>%
+    # clean and order
+    select(respondent_group, instrument, ds, segment, everything()) %>%
+    arrange(respondent_group, instrument, ds, segment)
+}
+
+# ============================================================
+# RUN IT
+# ============================================================
+
+# 1) Alpha by segment within each sheet group (Students/Educators × CCI/HxC/TEI)
+alpha_segment <- alpha_by_segment_from_survey_db(survey_db, by_ds = FALSE, n_min = 10)
+
+# 2) Alpha by segment within DS (this can be unstable if DS has small n)
+alpha_segment_ds <- alpha_by_segment_from_survey_db(survey_db, by_ds = TRUE, n_min = 10)
+
+knitr::kable(alpha_segment, digits = 3,
+             caption = "Cronbach's alpha (psych) by Segment within Respondent group × Instrument")
+
+knitr::kable(alpha_segment_ds, digits = 3,
+             caption = "Cronbach's alpha (psych) by Segment within Respondent group × Instrument × DS")
+
+```
+
+Prior to Multiple Factor Analysis, items presenting zero variance within specific respondent groups were identified and excluded, as they do not contribute to multivariate discrimination. Specifically, two items related to adoption and maintenance of CCI and two items related to digital oral health records (D-OHR) showed invariant responses among Educators, indicating unanimous agreement. These items were retained for descriptive analyses but excluded from MFA to ensure methodological validity.
+
+```{r}
+pkgs <- c("dplyr","purrr","stringr","tibble","tidyr","FactoMineR","factoextra","missMDA","janitor")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if(length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+```
+
+```{r}
+# --- reuso: columnas "items" excluyendo id, DS, respondent_group, instrument ---
+get_item_columns <- function(df, seg_map, extra_exclude = character()) {
+  stopifnot(ncol(df) >= 2)
+  col1 <- names(df)[1]
+  col2 <- names(df)[2]
+  exclude <- unique(c(col1, col2, "respondent_group", "instrument", extra_exclude))
+  exclude <- exclude[exclude %in% names(df)]
+  item_cols <- setdiff(names(df), exclude)
+
+  seg_item <- seg_map[item_cols]
+  keep <- !is.na(seg_item) &
+    stringr::str_trim(seg_item) != "" &
+    stringr::str_trim(seg_item) != "Unsegmented"
+
+  item_cols[keep]
+}
+
+# --- construir dataset ANCHO (wide) + grupos (segmentos) para MFA ---
+build_mfa_input_from_sheetobj <- function(sheet_obj,
+                                         keep_ds = FALSE,
+                                         drop_constant = TRUE) {
+  df        <- sheet_obj$data
+  seg_map   <- sheet_obj$seg_map
+  label_map <- sheet_obj$label_map
+
+  id_col <- names(df)[1]
+  ds_col <- names(df)[2]
+
+  item_cols <- get_item_columns(df, seg_map)
+  if (length(item_cols) < 2) return(NULL)
+
+  # X: solo items (numéricos)
+  X <- df %>%
+    dplyr::select(dplyr::all_of(item_cols)) %>%
+    dplyr::mutate(dplyr::across(dplyr::everything(), ~ suppressWarnings(as.numeric(as.character(.x))))) %>%
+    as.data.frame()
+
+  # opcional: quitar columnas constantes (var=0) que fastidian MFA
+  if (drop_constant) {
+    v <- vapply(X, function(z) var(z, na.rm = TRUE), numeric(1))
+    keep <- names(v)[is.finite(v) & v > 0]
+    X <- X[, keep, drop = FALSE]
+    item_cols <- intersect(item_cols, keep)
+    if (length(item_cols) < 2) return(NULL)
+  }
+
+  # grupos = segmentos, en el orden de columnas actuales
+  seg_vec <- unname(seg_map[item_cols])
+  seg_vec[is.na(seg_vec) | str_trim(seg_vec)=="" ] <- "Unsegmented"
+
+  # mantener solo segmentados
+  keep2 <- str_trim(seg_vec) != "Unsegmented"
+  X <- X[, keep2, drop = FALSE]
+  seg_vec <- seg_vec[keep2]
+  item_cols <- item_cols[keep2]
+  if (ncol(X) < 2) return(NULL)
+
+  # tamaños de grupo para MFA
+  groups <- tibble(item = item_cols, segment = seg_vec) %>%
+    count(segment, name = "ng") %>%
+    arrange(segment)
+
+  # reordenar columnas por segmento (mejor lectura)
+  ord <- order(seg_vec, item_cols)
+  X <- X[, ord, drop = FALSE]
+  seg_vec <- seg_vec[ord]
+  item_cols <- item_cols[ord]
+
+  group_sizes <- as.integer(tibble(segment=seg_vec) %>% count(segment) %>% pull(n))
+  group_names <- as.character(tibble(segment=seg_vec) %>% count(segment) %>% pull(segment))
+
+  # metadatos fila (id/ds) por si quieres colorear después
+  meta_rows <- df %>%
+    transmute(
+      respondent_id = .data[[id_col]],
+      ds = .data[[ds_col]],
+      respondent_group = .data[["respondent_group"]],
+      instrument = .data[["instrument"]]
+    )
+
+  if (!keep_ds) meta_rows <- meta_rows %>% select(-ds)
+
+  # labels bonitos (opcional)
+  item_labels <- unname(label_map[item_cols])
+
+  list(
+    X = X,
+    meta = meta_rows,
+    group_sizes = group_sizes,
+    group_names = group_names,
+    item_cols = item_cols,
+    item_labels = item_labels
+  )
+}
+
+```
+
+```{r}
+# ============================================================
+# MFA inputs por combo (Students/Educators × Instrument) ROBUSTO
+# - Alinea columnas
+# - Recalcula segmentación por columna buscando en TODAS las hojas del combo
+# - Elimina columnas all-NA / var=0 / Unsegmented
+# - Recalcula group_sizes SIEMPRE desde las columnas finales
+# ============================================================
+
+mfa_inputs_by_combo <- function(survey_db,
+                               keep_ds = TRUE,
+                               drop_constant = TRUE,
+                               min_rows = 3,
+                               min_cols = 2) {
+
+  # ---- helper: saca X numérico de una hoja (sin ordenar por segmentos aquí) ----
+  one_sheet_input <- function(sheet_obj, sheet_name) {
+    df      <- sheet_obj$data
+    seg_map <- sheet_obj$seg_map
+
+    item_cols <- get_item_columns(df, seg_map)
+    if (length(item_cols) < 2) return(NULL)
+
+    X <- df %>%
+      dplyr::select(dplyr::all_of(item_cols)) %>%
+      dplyr::mutate(dplyr::across(dplyr::everything(),
+                                  ~ suppressWarnings(as.numeric(as.character(.x))))) %>%
+      as.data.frame()
+
+    meta <- df %>%
+      dplyr::transmute(
+        respondent_id = .data[[names(df)[1]]],
+        ds = .data[[names(df)[2]]],
+        respondent_group = .data[["respondent_group"]],
+        instrument = .data[["instrument"]]
+      )
+
+    if (!keep_ds) meta <- meta %>% dplyr::select(-ds)
+
+    list(sheet = sheet_name, X = X, meta = meta)
+  }
+
+  # ---- 1) inputs por hoja ----
+  inputs <- purrr::imap(survey_db, ~ one_sheet_input(.x, .y))
+  inputs <- inputs[!vapply(inputs, is.null, logical(1))]
+
+  if (length(inputs) == 0) return(list())
+
+  # ---- 2) combos presentes ----
+  combos <- purrr::map_dfr(inputs, ~ dplyr::distinct(.x$meta, respondent_group, instrument)) %>%
+    dplyr::distinct()
+
+  # ---- helper: segment para cada columna buscando en todas las hojas del combo ----
+  get_seg_for_items <- function(items, sel_sheets, survey_db) {
+    seg <- rep(NA_character_, length(items))
+    names(seg) <- items
+
+    for (sh in sel_sheets) {
+      sm <- survey_db[[sh]]$seg_map
+      hit <- sm[items]
+      # rellenar donde aún es NA y aquí hay valor
+      to_fill <- is.na(seg) & !is.na(hit)
+      seg[to_fill] <- unname(hit[to_fill])
+      if (!any(is.na(seg))) break
+    }
+
+    seg[is.na(seg) | stringr::str_trim(seg) == ""] <- "Unsegmented"
+    seg
+  }
+
+  # ---- 3) construir dataset por combo ----
+  out <- purrr::pmap(combos, function(respondent_group, instrument) {
+
+    sel <- purrr::keep(inputs, ~{
+      unique(.x$meta$respondent_group) == respondent_group &&
+        unique(.x$meta$instrument) == instrument
+    })
+
+    if (length(sel) == 0) return(NULL)
+
+    sel_sheets <- vapply(sel, `[[`, character(1), "sheet")
+
+    # union de columnas
+    all_items <- Reduce(union, lapply(sel, \(z) colnames(z$X)))
+
+    # bind_rows alineando columnas
+    X_all <- purrr::map_dfr(sel, \(z){
+      X <- z$X
+      miss <- setdiff(all_items, colnames(X))
+      if (length(miss)) X[miss] <- NA_real_
+      X <- X[, all_items, drop = FALSE]
+      X
+    })
+
+    meta_all <- purrr::map_dfr(sel, \(z) z$meta)
+
+    # --- limpieza columnas ---
+    # (1) quitar columnas all-NA
+    keep_not_allna <- colSums(!is.na(X_all)) > 0
+    X_all <- X_all[, keep_not_allna, drop = FALSE]
+    all_items2 <- colnames(X_all)
+
+    if (ncol(X_all) < min_cols || nrow(X_all) < min_rows) return(NULL)
+
+    # (2) segmentación por columna (buscando en todas las hojas del combo)
+    seg_vec <- get_seg_for_items(all_items2, sel_sheets, survey_db)
+
+    # (3) quitar Unsegmented
+    keep_seg <- stringr::str_trim(seg_vec) != "Unsegmented"
+    X_all <- X_all[, keep_seg, drop = FALSE]
+    seg_vec <- seg_vec[keep_seg]
+
+    if (ncol(X_all) < min_cols) return(NULL)
+
+    # (4) quitar columnas constantes (var=0) si se pide
+    if (drop_constant) {
+      v <- vapply(X_all, function(z) var(z, na.rm = TRUE), numeric(1))
+      keep_var <- is.finite(v) & v > 0
+      X_all <- X_all[, keep_var, drop = FALSE]
+      seg_vec <- seg_vec[keep_var]
+      if (ncol(X_all) < min_cols) return(NULL)
+    }
+
+    # (5) ordenar columnas por segmento (para plots más claros)
+    ord <- order(seg_vec, colnames(X_all))
+    X_all <- X_all[, ord, drop = FALSE]
+    seg_vec <- seg_vec[ord]
+
+    # (6) group_sizes y group_names recalculados desde las columnas finales
+    grp <- tibble::tibble(segment = seg_vec) %>% dplyr::count(segment, name = "n") %>% dplyr::arrange(segment)
+
+    group_sizes <- as.integer(grp$n)
+    group_names <- as.character(grp$segment)
+
+    # validación final
+    if (sum(group_sizes) != ncol(X_all)) return(NULL)
+    if (any(group_sizes <= 0)) return(NULL)
+
+    list(
+      respondent_group = respondent_group,
+      instrument = instrument,
+      X = as.data.frame(X_all),
+      meta = meta_all,
+      group_sizes = group_sizes,
+      group_names = group_names,
+      seg_vec = seg_vec
+    )
+  })
+
+  out <- out[!vapply(out, is.null, logical(1))]
+  out
+}
+
+
+```
+
+```{r}
+run_mfa <- function(X, group_sizes, group_names,
+                    ncp = 5, impute = TRUE, graph = FALSE,
+                    min_rows = 3, min_cols = 2) {
+
+  X <- as.data.frame(X)
+
+  # ---- Validaciones duras ----
+  if (nrow(X) < min_rows) stop("MFA: too few rows.")
+  if (ncol(X) < min_cols) stop("MFA: too few columns.")
+  if (length(group_sizes) == 0) stop("MFA: group_sizes is empty.")
+  if (any(group_sizes <= 0)) stop("MFA: some group_sizes <= 0.")
+  if (sum(group_sizes) != ncol(X)) stop("MFA: sum(group_sizes) != ncol(X).")
+
+  has_na <- anyNA(as.matrix(X))
+
+  # ---- Imputación SOLO si hay NA ----
+  if (impute && has_na) {
+    imp <- missMDA::imputeMFA(
+      X,
+      group = group_sizes,
+      type  = rep("s", length(group_sizes)),
+      ncp   = ncp
+    )
+    X_use <- imp$completeObs
+  } else {
+    X_use <- X
+  }
+
+  FactoMineR::MFA(
+    X_use,
+    group      = group_sizes,
+    type       = rep("s", length(group_sizes)),
+    name.group = group_names,
+    ncp        = ncp,
+    graph      = graph
+  )
+}
+
+```
+
+```{r}
+combo_list <- mfa_inputs_by_combo(survey_db, keep_ds = TRUE, drop_constant = TRUE)
+
+mfa_results <- purrr::map(combo_list, function(obj) {
+  key <- paste(obj$respondent_group, obj$instrument, sep = " | ")
+
+  res <- tryCatch(
+    run_mfa(obj$X, obj$group_sizes, obj$group_names, ncp = 5, impute = TRUE, graph = FALSE),
+    error = function(e) e
+  )
+
+  if (inherits(res, "error")) {
+    message("MFA FAILED: ", key, " -> ", res$message)
+    return(list(meta = obj[c("respondent_group","instrument")], ok = FALSE, error = res$message))
+  }
+
+  list(meta = obj[c("respondent_group","instrument")], ok = TRUE, res = res, obj = obj)
+})
+
+# qué combos quedaron OK
+purrr::map_chr(mfa_results, \(z) paste0(z$meta$respondent_group, " | ", z$meta$instrument, " | ok=", z$ok))
+
+```
+
+```{r}
+ok_ids <- which(vapply(mfa_results, \(z) isTRUE(z$ok), logical(1)))
+one <- mfa_results[[ ok_ids[1] ]]$res
+
+factoextra::fviz_screeplot(one)
+factoextra::fviz_mfa_ind(one, repel = TRUE)
+factoextra::fviz_mfa_var(one, repel = TRUE)
+factoextra::fviz_mfa_group(one, repel = TRUE)
+
+```
+
+#####################################################################################
+#####################################################################################
+#####################################################################################
+#####################################################################################
+#####################################################################################
+#####################################################################################
+
+
+
+
+
+
+
+
+
+
+```{r}
+run_mfa_global_safe <- function(inp, ncp = 5, impute = TRUE, graph = FALSE) {
+
+  X <- as.data.frame(inp$X)
+
+  # Imputa solo si hay NA
+  if (impute && anyNA(as.matrix(X))) {
+    imp <- missMDA::imputeMFA(
+      X,
+      group = inp$group_sizes,
+      type  = rep("s", length(inp$group_sizes)),
+      ncp   = ncp
+    )
+    X_use <- as.data.frame(imp$completeObs)
+  } else {
+    X_use <- X
+  }
+
+  mfa <- FactoMineR::MFA(
+    X_use,
+    group      = inp$group_sizes,
+    type       = rep("s", length(inp$group_sizes)),
+    name.group = inp$group_names,
+    ncp        = ncp,
+    graph      = graph
+  )
+
+  # guardo metadatos como atributo para usarlos luego
+  attr(mfa, "meta") <- inp$meta
+  mfa
+}
+
+```
+
+```{r}
+mfa_input_global <- function(survey_db,
+                             keep_ds = TRUE,
+                             drop_constant = TRUE,
+                             min_rows = 3,
+                             min_cols = 2) {
+
+  # 1) Extraer X y meta de cada hoja
+  inputs <- purrr::imap(survey_db, function(sheet_obj, sheet_name) {
+
+    df      <- sheet_obj$data
+    seg_map <- sheet_obj$seg_map
+
+    item_cols <- get_item_columns(df, seg_map)
+    if (length(item_cols) < 2) return(NULL)
+
+    X <- df %>%
+      dplyr::select(dplyr::all_of(item_cols)) %>%
+      dplyr::mutate(dplyr::across(dplyr::everything(),
+                                  ~ suppressWarnings(as.numeric(as.character(.x))))) %>%
+      as.data.frame()
+
+    meta <- df %>%
+      dplyr::transmute(
+        respondent_id = .data[[names(df)[1]]],
+        ds = .data[[names(df)[2]]],
+        respondent_group = .data[["respondent_group"]],
+        instrument = .data[["instrument"]],
+        sheet = sheet_name
+      )
+
+    if (!keep_ds) meta <- meta %>% dplyr::select(-ds)
+
+    list(sheet = sheet_name, X = X, meta = meta)
+  })
+
+  inputs <- inputs[!vapply(inputs, is.null, logical(1))]
+  if (!length(inputs)) stop("No hay hojas válidas para construir el MFA global.")
+
+  # 2) Union de columnas (todos los items que existan en cualquier hoja)
+  all_items <- Reduce(union, lapply(inputs, \(z) colnames(z$X)))
+
+  # 3) Apilar filas alineando columnas
+  X_all <- purrr::map_dfr(inputs, \(z){
+    X <- z$X
+    miss <- setdiff(all_items, colnames(X))
+    if (length(miss)) X[miss] <- NA_real_
+    X <- X[, all_items, drop = FALSE]
+    X
+  })
+
+  meta_all <- purrr::map_dfr(inputs, \(z) z$meta)
+
+  # 4) Limpieza columnas
+  # (a) quitar all-NA
+  keep_not_allna <- colSums(!is.na(X_all)) > 0
+  X_all <- X_all[, keep_not_allna, drop = FALSE]
+
+  if (nrow(X_all) < min_rows || ncol(X_all) < min_cols) stop("Muy pocos datos tras all-NA.")
+
+  # (b) quitar var=0 si quieres
+  if (drop_constant) {
+    v <- vapply(X_all, function(z) var(z, na.rm = TRUE), numeric(1))
+    keep_var <- is.finite(v) & v > 0
+    X_all <- X_all[, keep_var, drop = FALSE]
+  }
+
+  if (ncol(X_all) < min_cols) stop("Muy pocas columnas tras var=0.")
+
+  # 5) Construir segmentación “global” por columna
+  # Buscamos el segmento del item en cualquier hoja (primera que lo tenga)
+  get_seg_global <- function(items, survey_db) {
+    seg <- rep(NA_character_, length(items))
+    names(seg) <- items
+
+    for (sh in names(survey_db)) {
+      sm <- survey_db[[sh]]$seg_map
+      hit <- sm[items]
+      to_fill <- is.na(seg) & !is.na(hit)
+      seg[to_fill] <- unname(hit[to_fill])
+      if (!any(is.na(seg))) break
+    }
+    seg[is.na(seg) | stringr::str_trim(seg) == ""] <- "Unsegmented"
+    seg
+  }
+
+  seg_vec <- get_seg_global(colnames(X_all), survey_db)
+
+  # (c) quitar Unsegmented
+  keep_seg <- stringr::str_trim(seg_vec) != "Unsegmented"
+  X_all <- X_all[, keep_seg, drop = FALSE]
+  seg_vec <- seg_vec[keep_seg]
+
+  if (ncol(X_all) < min_cols) stop("Muy pocas columnas tras Unsegmented.")
+
+  # 6) Ordenar por segmento
+  ord <- order(seg_vec, colnames(X_all))
+  X_all <- X_all[, ord, drop = FALSE]
+  seg_vec <- seg_vec[ord]
+
+  # 7) group_sizes / group_names
+  grp <- tibble::tibble(segment = seg_vec) %>%
+    dplyr::count(segment, name = "n") %>%
+    dplyr::arrange(segment)
+
+  group_sizes <- as.integer(grp$n)
+  group_names <- as.character(grp$segment)
+
+  list(
+    X = as.data.frame(X_all),
+    meta = meta_all,
+    group_sizes = group_sizes,
+    group_names = group_names,
+    seg_vec = seg_vec
+  )
+}
+
+inp_global <- mfa_input_global(survey_db, keep_ds = TRUE, drop_constant = TRUE)
+mfa_global <- run_mfa_global_safe(inp_global, ncp = 5, impute = TRUE)
+
+meta <- attr(mfa_global, "meta")
+
+# Scree
+factoextra::fviz_screeplot(mfa_global, addlabels = TRUE)
+
+# Individuos coloreados por DS
+factoextra::fviz_mfa_ind(
+  mfa_global,
+  habillage = as.factor(meta$ds),
+  addEllipses = TRUE,
+  repel = TRUE
+)
+
+# Individuos coloreados por grupo
+factoextra::fviz_mfa_ind(
+  mfa_global,
+  habillage = as.factor(meta$respondent_group),
+  addEllipses = TRUE,
+  repel = TRUE
+)
+
+# Individuos coloreados por instrumento
+factoextra::fviz_mfa_ind(
+  mfa_global,
+  habillage = as.factor(meta$instrument),
+  addEllipses = TRUE,
+  repel = TRUE
+)
+
+# Variables (selecciona top contrib para que no sea ilegible)
+factoextra::fviz_mfa_var(
+  mfa_global,
+  "quanti.var",
+  repel = TRUE,
+  select.var = list(contrib = 20)
+)
+
+# Grupos de variables
+factoextra::fviz_mfa_group(mfa_global, repel = TRUE)
+
+```
+
+```{r}
+coord <- as.data.frame(mfa_global$ind$coord)
+meta  <- attr(mfa_global, "meta")
+
+df_dim <- dplyr::bind_cols(meta, coord)
+
+# ANOVA simple (ejemplo Dim1)
+summary(aov(Dim.1 ~ respondent_group, data = df_dim))
+summary(aov(Dim.1 ~ instrument, data = df_dim))
+summary(aov(Dim.1 ~ ds, data = df_dim))
+
+# Modelo conjunto (más serio)
+summary(lm(Dim.1 ~ respondent_group + instrument + ds, data = df_dim))
+summary(lm(Dim.2 ~ respondent_group + instrument + ds, data = df_dim))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#####################################################################################
+#####################################################################################
+#####################################################################################
+#####################################################################################
+#####################################################################################
+#####################################################################################
+
+
+
+
+
+
+```{r}
+pkgs <- c("dplyr","tibble","stringr","purrr","missMDA","FactoMineR","factoextra","psych")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if(length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+```
+
+```{r}
+impute_mode_ordinal <- function(df) {
+  out <- df
+  for (j in seq_along(out)) {
+    x <- out[[j]]
+    if (all(is.na(x))) next
+    tab <- table(x, useNA = "no")
+    mode_val <- names(tab)[which.max(tab)]
+    out[[j]][is.na(out[[j]])] <- mode_val
+  }
+  out
+}
+
+```
+
+```{r}
+poly_pca_scores <- function(df_block, ncp = 2) {
+  # df_block: data.frame con ítems Likert (1-5) (idealmente como ordered)
+  df_block <- as.data.frame(df_block)
+
+  # Imputa NA (modo) para poder calcular policórica
+  df_imp <- impute_mode_ordinal(df_block)
+
+  # Asegura ordinal (ordered factor) si viene como num/char
+  df_imp <- df_imp %>%
+    mutate(across(everything(), ~ {
+      if (is.factor(.x) && is.ordered(.x)) return(.x)
+      # fuerza niveles 1..5 si aplica
+      ordered(as.character(.x), levels = sort(unique(as.character(.x))))
+    }))
+
+  # Correlación policórica
+  pc <- psych::polychoric(df_imp)
+  R  <- pc$rho
+
+  # PCA (eigen)
+  eig <- eigen(R, symmetric = TRUE)
+  loadings <- eig$vectors[, 1:ncp, drop = FALSE] %*% diag(sqrt(pmax(eig$values[1:ncp], 0)))
+  colnames(loadings) <- paste0("PC", 1:ncp)
+  rownames(loadings) <- colnames(df_imp)
+
+  # Datos numéricos estandarizados (solo para construir scores)
+  Z <- df_imp %>%
+    mutate(across(everything(), ~ as.numeric(as.character(.x)))) %>%
+    as.matrix()
+  Z <- scale(Z)
+
+  # Scores tipo regresión: W = R^{-1} L (L' R^{-1} L)^{-1}
+  Rinv <- tryCatch(solve(R), error = function(e) MASS::ginv(R))
+  mid  <- tryCatch(solve(t(loadings) %*% Rinv %*% loadings),
+                   error = function(e) MASS::ginv(t(loadings) %*% Rinv %*% loadings))
+  W <- Rinv %*% loadings %*% mid
+
+  scores <- Z %*% W
+  scores <- as.data.frame(scores)
+  colnames(scores) <- paste0("PC", 1:ncp)
+
+  # Varianza explicada (por eigenvalues / p)
+  p <- ncol(R)
+  var_exp <- eig$values[1:ncp] / sum(eig$values)
+  names(var_exp) <- paste0("PC", 1:ncp)
+
+  list(scores = scores, var_exp = var_exp, R = R, loadings = loadings)
+}
+
+```
+
+```{r}
+build_poly_scores_by_block <- function(inp, ncp_block = 2) {
+
+  X <- inp$X
+  seg_vec <- inp$seg_vec
+
+  # split columnas por bloque
+  blocks <- split(colnames(X), seg_vec)
+
+  # para cada bloque => scores (n x ncp_block)
+  score_list <- lapply(names(blocks), function(g) {
+    cols <- blocks[[g]]
+    res <- poly_pca_scores(X[, cols, drop = FALSE], ncp = ncp_block)
+    out <- res$scores
+    colnames(out) <- paste0(g, "__PC", seq_len(ncp_block))
+    attr(out, "var_exp") <- res$var_exp
+    out
+  })
+  names(score_list) <- names(blocks)
+
+  scores_all <- dplyr::bind_cols(score_list)
+
+  # grupos del nuevo MFA: cada bloque aporta ncp_block columnas
+  group_sizes2 <- rep(ncp_block, length(blocks))
+  group_names2 <- names(blocks)
+
+  list(scores = as.data.frame(scores_all),
+       group_sizes = group_sizes2,
+       group_names = group_names2,
+       meta = inp$meta)
+}
+
+```
+
+```{r}
+inp_poly <- build_poly_scores_by_block(inp_global, ncp_block = 2)
+
+mfa_poly <- FactoMineR::MFA(
+  inp_poly$scores,
+  group      = inp_poly$group_sizes,
+  type       = rep("s", length(inp_poly$group_sizes)),
+  name.group = inp_poly$group_names,
+  ncp        = 5,
+  graph      = FALSE
+)
+
+factoextra::fviz_screeplot(mfa_poly, addlabels = TRUE)
+factoextra::fviz_mfa_group(mfa_poly, repel = TRUE)
+
+```
+
+```{r}
+meta <- inp_poly$meta
+
+factoextra::fviz_mfa_ind(mfa_poly, habillage = as.factor(meta$ds),
+                         addEllipses = TRUE, repel = TRUE)
+
+factoextra::fviz_mfa_ind(mfa_poly, habillage = as.factor(meta$respondent_group),
+                         addEllipses = TRUE, repel = TRUE)
+
+factoextra::fviz_mfa_ind(mfa_poly, habillage = as.factor(meta$instrument),
+                         addEllipses = TRUE, repel = TRUE)
+
+```
+
+```{r}
+# ============================================================
+# 0) Paquetes extra (por si no los tienes)
+# ============================================================
+pkgs2 <- c("dplyr","tibble","purrr")
+to_install2 <- pkgs2[!pkgs2 %in% rownames(installed.packages())]
+if(length(to_install2)) install.packages(to_install2)
+invisible(lapply(pkgs2, library, character.only = TRUE))
+
+# ============================================================
+# 1) Helper: % var explicada Dim1+Dim2 para un MFA
+#    (FactoMineR guarda eigenvalues en $eig)
+# ============================================================
+mfa_dim12_explained <- function(mfa_obj) {
+  stopifnot(!is.null(mfa_obj$eig))
+  # en FactoMineR: columna 2 = porcentaje por dimensión
+  d1 <- mfa_obj$eig[1, 2]
+  d2 <- mfa_obj$eig[2, 2]
+  tibble::tibble(
+    Dim1 = d1,
+    Dim2 = d2,
+    Dim1_Dim2 = d1 + d2
+  )
+}
+
+# ============================================================
+# 2) Helper: tabla var_exp por bloque (PC1/PC2) + resumen
+#    Usa la misma lógica de bloques (seg_vec) y vuelve a correr
+#    poly_pca_scores() por bloque para recuperar var_exp.
+# ============================================================
+poly_var_table_by_block <- function(inp, ncp_block = 2) {
+  X <- inp$X
+  seg_vec <- inp$seg_vec
+  blocks <- split(colnames(X), seg_vec)
+
+  # recalcula policórico por bloque y guarda var_exp
+  out <- purrr::map_dfr(names(blocks), function(g) {
+    cols <- blocks[[g]]
+    # OJO: poly_pca_scores debe estar definido en tu script
+    res <- poly_pca_scores(X[, cols, drop = FALSE], ncp = ncp_block)
+
+    ve <- res$var_exp
+    # si algún bloque tiene menos de ncp_block posible, lo protegemos
+    pc1 <- if(length(ve) >= 1) unname(ve[1]) else NA_real_
+    pc2 <- if(length(ve) >= 2) unname(ve[2]) else NA_real_
+
+    tibble::tibble(
+      block = g,
+      n_items = length(cols),
+      PC1 = pc1,
+      PC2 = pc2,
+      PC1_PC2 = pc1 + pc2
+    )
+  })
+
+  out %>%
+    dplyr::arrange(dplyr::desc(PC1_PC2))
+}
+
+# ============================================================
+# 3) Corre MFA policórico por bloques (si no lo tienes ya)
+# ============================================================
+# ncp_block = 2 => sacas PC1 y PC2 por bloque
+inp_poly <- build_poly_scores_by_block(inp_global, ncp_block = 2)
+
+mfa_poly <- FactoMineR::MFA(
+  inp_poly$scores,
+  group      = inp_poly$group_sizes,
+  type       = rep("s", length(inp_poly$group_sizes)),
+  name.group = inp_poly$group_names,
+  ncp        = 5,
+  graph      = FALSE
+)
+
+# ============================================================
+# 4) Reporte comparativo "antes vs después"
+# ============================================================
+before <- mfa_dim12_explained(mfa_global) %>%
+  dplyr::mutate(model = "MFA clásico (ítems originales)")
+
+after  <- mfa_dim12_explained(mfa_poly) %>%
+  dplyr::mutate(model = "MFA policórico por bloques (PCs)")
+
+compare_dim12 <- dplyr::bind_rows(before, after) %>%
+  dplyr::select(model, Dim1, Dim2, Dim1_Dim2)
+
+print(compare_dim12)
+
+# Mensaje amigable
+cat("\n--- Resumen ---\n")
+cat("Dim1+Dim2 (clásico):   ", round(before$Dim1_Dim2, 2), "%\n")
+cat("Dim1+Dim2 (policórico):", round(after$Dim1_Dim2, 2), "%\n")
+cat("Diferencia:            ", round(after$Dim1_Dim2 - before$Dim1_Dim2, 2), "p.p.\n")
+
+# ============================================================
+# 5) Tabla por bloque: var_exp PC1/PC2 (justificación)
+# ============================================================
+tab_blocks <- poly_var_table_by_block(inp_global, ncp_block = 2)
+
+print(tab_blocks)
+
+# Un resumen global (promedios simples)
+cat("\n--- Bloques (promedio simple) ---\n")
+cat("Promedio PC1:     ", round(mean(tab_blocks$PC1, na.rm = TRUE) * 100, 1), "%\n")
+cat("Promedio PC2:     ", round(mean(tab_blocks$PC2, na.rm = TRUE) * 100, 1), "%\n")
+cat("Promedio PC1+PC2: ", round(mean(tab_blocks$PC1_PC2, na.rm = TRUE) * 100, 1), "%\n")
+
+```
+
+```{r}
+pkgs <- c("dplyr","tibble","stringr","purrr","missMDA","FactoMineR","factoextra","psych","MASS")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if(length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+
+impute_mode_ordinal <- function(df) {
+  out <- df
+  for (j in seq_along(out)) {
+    x <- out[[j]]
+    if (all(is.na(x))) next
+    tab <- table(x, useNA = "no")
+    mode_val <- names(tab)[which.max(tab)]
+    out[[j]][is.na(out[[j]])] <- mode_val
+  }
+  out
+}
+
+poly_pca_scores <- function(df_block, ncp = 2) {
+  df_block <- as.data.frame(df_block)
+
+  df_imp <- impute_mode_ordinal(df_block)
+
+  df_imp <- df_imp %>%
+    dplyr::mutate(dplyr::across(dplyr::everything(), ~ {
+      if (is.factor(.x) && is.ordered(.x)) return(.x)
+      ordered(as.character(.x), levels = sort(unique(as.character(.x))))
+    }))
+
+  pc <- psych::polychoric(df_imp)
+  R  <- pc$rho
+
+  eig <- eigen(R, symmetric = TRUE)
+  loadings <- eig$vectors[, 1:ncp, drop = FALSE] %*% diag(sqrt(pmax(eig$values[1:ncp], 0)))
+  colnames(loadings) <- paste0("PC", 1:ncp)
+  rownames(loadings) <- colnames(df_imp)
+
+  Z <- df_imp %>%
+    dplyr::mutate(dplyr::across(dplyr::everything(), ~ as.numeric(as.character(.x)))) %>%
+    as.matrix()
+  Z <- scale(Z)
+
+  Rinv <- tryCatch(solve(R), error = function(e) MASS::ginv(R))
+  mid  <- tryCatch(solve(t(loadings) %*% Rinv %*% loadings),
+                   error = function(e) MASS::ginv(t(loadings) %*% Rinv %*% loadings))
+  W <- Rinv %*% loadings %*% mid
+
+  scores <- Z %*% W
+  scores <- as.data.frame(scores)
+  colnames(scores) <- paste0("PC", 1:ncp)
+
+  var_exp <- eig$values[1:ncp] / sum(eig$values)
+  names(var_exp) <- paste0("PC", 1:ncp)
+
+  list(scores = scores, var_exp = var_exp, R = R, loadings = loadings)
+}
+
+# ------------------------------------------------------------
+# AUTOMÁTICO: 1 vs 2 PCs por bloque
+# ------------------------------------------------------------
+build_poly_scores_by_block_auto <- function(inp,
+                                            max_pcs = 2,
+                                            thr_pc1  = 0.85,
+                                            thr_cum2 = 0.75,
+                                            min_items_for_pca = 2) {
+
+  X <- inp$X
+  seg_vec <- inp$seg_vec
+  blocks <- split(colnames(X), seg_vec)
+
+  block_summ <- list()
+  score_list  <- list()
+
+  for (g in names(blocks)) {
+    cols <- blocks[[g]]
+
+    # Si el bloque tiene <2 ítems, no hay PCA real. Caso extremo:
+    if (length(cols) < min_items_for_pca) {
+      # alternativa simple: usar el ítem tal cual como "PC1"
+      sc <- X[, cols, drop = FALSE]
+      colnames(sc) <- paste0(g, "__PC1")
+      score_list[[g]] <- as.data.frame(sc)
+      block_summ[[g]] <- tibble::tibble(
+        block = g, n_items = length(cols),
+        pc_used = 1,
+        PC1 = NA_real_, PC2 = NA_real_, PC1_PC2 = NA_real_,
+        rule = "n_items<2 -> uso ítem como PC1"
+      )
+      next
+    }
+
+    # Calcula hasta 2 PCs (policórica + PCA)
+    res2 <- poly_pca_scores(X[, cols, drop = FALSE], ncp = max_pcs)
+    ve <- res2$var_exp
+    pc1 <- unname(ve[1])
+    pc2 <- if (length(ve) >= 2) unname(ve[2]) else NA_real_
+    cum2 <- if (!is.na(pc2)) pc1 + pc2 else pc1
+
+    # Decide pcs
+    pcs_use <- if (!is.na(pc1) && pc1 >= thr_pc1) 1 else 2
+    rule_txt <- if (pcs_use == 1) {
+      paste0("PC1>= ", thr_pc1)
+    } else if (!is.na(cum2) && cum2 >= thr_cum2) {
+      paste0("PC1<", thr_pc1, " y PC1+PC2>= ", thr_cum2)
+    } else {
+      paste0("PC1+PC2<", thr_cum2, " -> uso 2 PCs por defecto")
+    }
+
+    sc <- res2$scores[, 1:pcs_use, drop = FALSE]
+    colnames(sc) <- paste0(g, "__PC", seq_len(pcs_use))
+    score_list[[g]] <- as.data.frame(sc)
+
+    block_summ[[g]] <- tibble::tibble(
+      block = g, n_items = length(cols),
+      pc_used = pcs_use,
+      PC1 = pc1,
+      PC2 = pc2,
+      PC1_PC2 = cum2,
+      rule = rule_txt
+    )
+  }
+
+  scores_all <- dplyr::bind_cols(score_list)
+
+  # group sizes = pcs usados por bloque
+  summ_df <- dplyr::bind_rows(block_summ) %>% dplyr::arrange(block)
+  group_sizes2 <- summ_df$pc_used
+  group_names2 <- summ_df$block
+
+  list(
+    scores = as.data.frame(scores_all),
+    group_sizes = as.integer(group_sizes2),
+    group_names = as.character(group_names2),
+    block_summary = summ_df,
+    meta = inp$meta
+  )
+}
+
+# ------------------------------------------------------------
+# RUN: MFA policórico auto (1/2 PCs por bloque) + reporte
+# ------------------------------------------------------------
+run_mfa_poly_auto <- function(inp_global,
+                              thr_pc1 = 0.85,
+                              thr_cum2 = 0.75,
+                              ncp_mfa = 5,
+                              graph = FALSE) {
+
+  inp_auto <- build_poly_scores_by_block_auto(
+    inp_global,
+    max_pcs = 2,
+    thr_pc1 = thr_pc1,
+    thr_cum2 = thr_cum2
+  )
+
+  mfa_auto <- FactoMineR::MFA(
+    inp_auto$scores,
+    group      = inp_auto$group_sizes,
+    type       = rep("s", length(inp_auto$group_sizes)),
+    name.group = inp_auto$group_names,
+    ncp        = ncp_mfa,
+    graph      = graph
+  )
+
+  attr(mfa_auto, "meta") <- inp_auto$meta
+  list(inp_auto = inp_auto, mfa_auto = mfa_auto)
+}
+
+# --------------------------
+# Ejemplo de uso:
+# res_auto <- run_mfa_poly_auto(inp_global, thr_pc1 = 0.85, thr_cum2 = 0.75)
+# mfa_auto <- res_auto$mfa_auto
+# res_auto$inp_auto$block_summary
+# factoextra::fviz_screeplot(mfa_auto, addlabels = TRUE)
+# meta <- attr(mfa_auto, "meta")
+# factoextra::fviz_mfa_ind(mfa_auto, habillage = as.factor(meta$respondent_group), addEllipses = TRUE, repel=TRUE)
+
+```
+
+```{r message=FALSE, warning=FALSE}
+pkgs <- c("dplyr","tibble","stringr","purrr","missMDA","FactoMineR","factoextra","psych","MASS","ggplot2","knitr")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if(length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+dir.create("outputs", showWarnings = FALSE)
+
+# -----------------------------
+# Helpers: tablas + var Dim1/2
+# -----------------------------
+mfa_dim12 <- function(mfa){
+  # FactoMineR guarda %var en columna 2 de mfa$eig
+  d1 <- as.numeric(mfa$eig[1,2])
+  d2 <- as.numeric(mfa$eig[2,2])
+  tibble::tibble(Dim1 = d1, Dim2 = d2, Dim1_Dim2 = d1 + d2)
+}
+
+save_table_csv <- function(df, filename){
+  path <- file.path("outputs", filename)
+  write.csv(df, path, row.names = FALSE)
+  path
+}
+
+save_plot_pdf_png <- function(p, stem, w=10, h=7){
+  pdf_path <- file.path("outputs", paste0(stem, ".pdf"))
+  png_path <- file.path("outputs", paste0(stem, ".png"))
+  ggplot2::ggsave(pdf_path, plot = p, width = w, height = h, device = "pdf")
+  ggplot2::ggsave(png_path, plot = p, width = w, height = h, dpi = 200)
+  list(pdf = pdf_path, png = png_path)
+}
+
+# -----------------------------
+# MFA clásico (global)
+# -----------------------------
+run_mfa_classic_global <- function(inp, ncp = 5, impute = TRUE, graph = FALSE){
+  X <- as.data.frame(inp$X)
+
+  if (impute && anyNA(as.matrix(X))) {
+    imp <- missMDA::imputeMFA(
+      X,
+      group = inp$group_sizes,
+      type  = rep("s", length(inp$group_sizes)),
+      ncp   = ncp
+    )
+    X_use <- imp$completeObs
+  } else {
+    X_use <- X
+  }
+
+  mfa <- FactoMineR::MFA(
+    X_use,
+    group      = inp$group_sizes,
+    type       = rep("s", length(inp$group_sizes)),
+    name.group = inp$group_names,
+    ncp        = ncp,
+    graph      = graph
+  )
+  attr(mfa, "meta") <- inp$meta
+  mfa
+}
+
+# -----------------------------
+# Policórico por bloque: utilidades
+# -----------------------------
+impute_mode_ordinal <- function(df) {
+  out <- df
+  for (j in seq_along(out)) {
+    x <- out[[j]]
+    if (all(is.na(x))) next
+    tab <- table(x, useNA = "no")
+    mode_val <- names(tab)[which.max(tab)]
+    out[[j]][is.na(out[[j]])] <- mode_val
+  }
+  out
+}
+
+poly_pca_scores <- function(df_block, ncp = 2) {
+  df_block <- as.data.frame(df_block)
+  df_imp <- impute_mode_ordinal(df_block)
+
+  df_imp <- df_imp %>%
+    dplyr::mutate(dplyr::across(dplyr::everything(), ~ {
+      if (is.factor(.x) && is.ordered(.x)) return(.x)
+      ordered(as.character(.x), levels = sort(unique(as.character(.x))))
+    }))
+
+  pc <- psych::polychoric(df_imp)
+  R  <- pc$rho
+
+  eig <- eigen(R, symmetric = TRUE)
+  loadings <- eig$vectors[, 1:ncp, drop = FALSE] %*% diag(sqrt(pmax(eig$values[1:ncp], 0)))
+  colnames(loadings) <- paste0("PC", 1:ncp)
+
+  Z <- df_imp %>%
+    dplyr::mutate(dplyr::across(dplyr::everything(), ~ as.numeric(as.character(.x)))) %>%
+    as.matrix()
+  Z <- scale(Z)
+
+  Rinv <- tryCatch(solve(R), error = function(e) MASS::ginv(R))
+  mid  <- tryCatch(solve(t(loadings) %*% Rinv %*% loadings),
+                   error = function(e) MASS::ginv(t(loadings) %*% Rinv %*% loadings))
+  W <- Rinv %*% loadings %*% mid
+
+  scores <- as.data.frame(Z %*% W)
+  colnames(scores) <- paste0("PC", 1:ncp)
+
+  var_exp <- eig$values[1:ncp] / sum(eig$values)
+  names(var_exp) <- paste0("PC", 1:ncp)
+
+  list(scores = scores, var_exp = var_exp)
+}
+
+build_poly_scores_by_block_fixed <- function(inp, ncp_block = 2) {
+  X <- inp$X
+  seg_vec <- inp$seg_vec
+  blocks <- split(colnames(X), seg_vec)
+
+  score_list <- list()
+  block_summary <- list()
+
+  for (g in names(blocks)) {
+    cols <- blocks[[g]]
+    res <- poly_pca_scores(X[, cols, drop = FALSE], ncp = ncp_block)
+    out <- res$scores
+    colnames(out) <- paste0(g, "__PC", seq_len(ncp_block))
+    score_list[[g]] <- out
+
+    ve <- res$var_exp
+    pc1 <- unname(ve[1]); pc2 <- unname(ve[2]); cum2 <- pc1 + pc2
+    block_summary[[g]] <- tibble::tibble(
+      block = g, n_items = length(cols),
+      pc_used = ncp_block,
+      PC1 = pc1, PC2 = pc2, PC1_PC2 = cum2,
+      rule = paste0("fijo ", ncp_block, " PCs")
+    )
+  }
+
+  scores_all <- dplyr::bind_cols(score_list)
+  group_sizes2 <- rep(ncp_block, length(score_list))
+  group_names2 <- names(score_list)
+
+  list(
+    scores = as.data.frame(scores_all),
+    group_sizes = as.integer(group_sizes2),
+    group_names = as.character(group_names2),
+    block_summary = dplyr::bind_rows(block_summary) %>% dplyr::arrange(block),
+    meta = inp$meta
+  )
+}
+
+build_poly_scores_by_block_auto <- function(inp,
+                                            thr_pc1  = 0.85,
+                                            thr_cum2 = 0.75,
+                                            min_items_for_pca = 2) {
+  X <- inp$X
+  seg_vec <- inp$seg_vec
+  blocks <- split(colnames(X), seg_vec)
+
+  score_list <- list()
+  block_summary <- list()
+
+  for (g in names(blocks)) {
+    cols <- blocks[[g]]
+
+    if (length(cols) < min_items_for_pca) {
+      sc <- X[, cols, drop = FALSE]
+      colnames(sc) <- paste0(g, "__PC1")
+      score_list[[g]] <- as.data.frame(sc)
+
+      block_summary[[g]] <- tibble::tibble(
+        block = g, n_items = length(cols),
+        pc_used = 1,
+        PC1 = NA_real_, PC2 = NA_real_, PC1_PC2 = NA_real_,
+        rule = "n_items<2 -> uso ítem como PC1"
+      )
+      next
+    }
+
+    res2 <- poly_pca_scores(X[, cols, drop = FALSE], ncp = 2)
+    ve <- res2$var_exp
+    pc1 <- unname(ve[1]); pc2 <- unname(ve[2]); cum2 <- pc1 + pc2
+
+    pcs_use <- if (!is.na(pc1) && pc1 >= thr_pc1) 1 else 2
+    rule_txt <- if (pcs_use == 1) {
+      paste0("PC1>= ", thr_pc1)
+    } else if (!is.na(cum2) && cum2 >= thr_cum2) {
+      paste0("PC1<", thr_pc1, " y PC1+PC2>= ", thr_cum2)
+    } else {
+      paste0("PC1+PC2<", thr_cum2, " -> uso 2 PCs por defecto")
+    }
+
+    sc <- res2$scores[, 1:pcs_use, drop = FALSE]
+    colnames(sc) <- paste0(g, "__PC", seq_len(pcs_use))
+    score_list[[g]] <- as.data.frame(sc)
+
+    block_summary[[g]] <- tibble::tibble(
+      block = g, n_items = length(cols),
+      pc_used = pcs_use,
+      PC1 = pc1, PC2 = pc2, PC1_PC2 = cum2,
+      rule = rule_txt
+    )
+  }
+
+  scores_all <- dplyr::bind_cols(score_list)
+  summ_df <- dplyr::bind_rows(block_summary) %>% dplyr::arrange(block)
+
+  list(
+    scores = as.data.frame(scores_all),
+    group_sizes = as.integer(summ_df$pc_used),
+    group_names = as.character(summ_df$block),
+    block_summary = summ_df,
+    meta = inp$meta
+  )
+}
+
+run_mfa_from_scores <- function(score_obj, ncp = 5, graph = FALSE){
+  mfa <- FactoMineR::MFA(
+    score_obj$scores,
+    group      = score_obj$group_sizes,
+    type       = rep("s", length(score_obj$group_sizes)),
+    name.group = score_obj$group_names,
+    ncp        = ncp,
+    graph      = graph
+  )
+  attr(mfa, "meta") <- score_obj$meta
+  mfa
+}
+
+# -----------------------------
+# Resumen narrativo por bloque
+# -----------------------------
+narrative_by_block <- function(block_df){
+  block_df %>%
+    dplyr::mutate(
+      style = dplyr::case_when(
+        pc_used == 1 ~ "unidimensional",
+        pc_used == 2 & !is.na(PC2) & (PC2 / pmax(PC1, 1e-9)) < 0.25 ~ "bidimensional suave",
+        pc_used == 2 ~ "bidimensional marcada",
+        TRUE ~ "no definido"
+      ),
+      narrative = dplyr::case_when(
+        pc_used == 1 ~ paste0(block, " unidimensional (PC1 captura casi toda la varianza intrabloque)."),
+        style == "bidimensional suave" ~ paste0(block, " bidimensional suave (PC2 aporta señal secundaria)."),
+        style == "bidimensional marcada" ~ paste0(block, " bidimensional marcada (PC2 aporta estructura relevante)."),
+        TRUE ~ paste0(block, ": revisar.")
+      )
+    )
+}
+
+# ============================================================
+# 1) CORRE LOS 3 MODELOS
+# ============================================================
+mfa_classic <- run_mfa_classic_global(inp_global, ncp = 5, impute = TRUE)
+poly_fixed  <- build_poly_scores_by_block_fixed(inp_global, ncp_block = 2)
+mfa_fixed   <- run_mfa_from_scores(poly_fixed, ncp = 5)
+
+poly_auto   <- build_poly_scores_by_block_auto(inp_global, thr_pc1 = 0.85, thr_cum2 = 0.75)
+mfa_auto    <- run_mfa_from_scores(poly_auto, ncp = 5)
+
+meta_classic <- attr(mfa_classic, "meta")
+meta_fixed   <- attr(mfa_fixed, "meta")
+meta_auto    <- attr(mfa_auto, "meta")
+
+# ============================================================
+# 2) TABLA COMPARATIVA Dim1+Dim2 (HTML + CSV)
+# ============================================================
+cmp <- dplyr::bind_rows(
+  dplyr::bind_cols(tibble::tibble(model="MFA clásico (ítems originales)"), mfa_dim12(mfa_classic)),
+  dplyr::bind_cols(tibble::tibble(model="MFA policórico 2PC fijo/bloque"), mfa_dim12(mfa_fixed)),
+  dplyr::bind_cols(tibble::tibble(model="MFA policórico AUTO (1 vs 2 PCs/bloque)"), mfa_dim12(mfa_auto))
+)
+
+cmp_path <- save_table_csv(cmp, "cmp_dim12_models.csv")
+knitr::kable(cmp, digits = 2, caption = "Comparación de varianza explicada por Dim1/Dim2 (tres modelos)")
+
+cat("\nArchivo guardado:", cmp_path, "\n")
+
+# ============================================================
+# 3) TABLA POR BLOQUE (AUTO) + NARRATIVA (HTML + CSV)
+# ============================================================
+block_tbl <- poly_auto$block_summary %>%
+  dplyr::mutate(
+    PC1 = round(PC1, 3),
+    PC2 = round(PC2, 3),
+    PC1_PC2 = round(PC1_PC2, 3)
+  )
+
+block_path <- save_table_csv(block_tbl, "block_summary_auto.csv")
+knitr::kable(block_tbl, caption = "AUTO: Varianza intrabloque (PC1/PC2), PCs usados y regla de decisión")
+
+cat("\nArchivo guardado:", block_path, "\n")
+
+narr <- narrative_by_block(poly_auto$block_summary) %>%
+  dplyr::select(block, n_items, pc_used, style, narrative)
+
+narr_path <- save_table_csv(narr, "block_narrative_auto.csv")
+knitr::kable(narr, caption = "AUTO: Mini-resumen narrativo por bloque")
+
+cat("\nArchivo guardado:", narr_path, "\n")
+
+# ============================================================
+# 4) GRÁFICOS (se guardan PDF+PNG y se muestran PNG en HTML)
+#    - “que me muestre todo”: scree + group + ind por DS/grupo/instrument
+# ============================================================
+make_plots <- function(mfa, meta, prefix){
+  plots <- list(
+    scree = factoextra::fviz_screeplot(mfa, addlabels = TRUE),
+    groups = factoextra::fviz_mfa_group(mfa, repel = TRUE),
+    ind_ds = factoextra::fviz_mfa_ind(mfa, habillage = as.factor(meta$ds), addEllipses = TRUE, repel = TRUE),
+    ind_resp = factoextra::fviz_mfa_ind(mfa, habillage = as.factor(meta$respondent_group), addEllipses = TRUE, repel = TRUE),
+    ind_instr = factoextra::fviz_mfa_ind(mfa, habillage = as.factor(meta$instrument), addEllipses = TRUE, repel = TRUE)
+  )
+
+  out_files <- list()
+  for (nm in names(plots)) {
+    stem <- paste0(prefix, "_", nm)
+    out_files[[nm]] <- save_plot_pdf_png(plots[[nm]], stem = stem, w = 11, h = 7)
+  }
+  out_files
+}
+
+files_classic <- make_plots(mfa_classic, meta_classic, "classic")
+files_fixed   <- make_plots(mfa_fixed,   meta_fixed,   "poly_fixed2pc")
+files_auto    <- make_plots(mfa_auto,    meta_auto,    "poly_auto")
+
+# Mostrar en HTML (PNG)
+show_pngs <- function(files_list, title){
+  cat("\n\n### ", title, "\n\n")
+  pngs <- unlist(lapply(files_list, function(x) x$png))
+  knitr::include_graphics(pngs)
+}
+
+show_pngs(files_classic, "Gráficos — MFA clásico")
+show_pngs(files_fixed,   "Gráficos — MFA policórico (2PC fijo por bloque)")
+show_pngs(files_auto,    "Gráficos — MFA policórico AUTO (1 vs 2 PCs por bloque)")
+
+cat("\n\n**Nota:** Todos los gráficos también están guardados en PDF dentro de la carpeta `outputs/`.\n")
+
+```
+
+```{r}
+pkgs2 <- c("ggpubr")
+to_install2 <- pkgs2[!pkgs2 %in% rownames(installed.packages())]
+if(length(to_install2)) install.packages(to_install2)
+invisible(lapply(pkgs2, library, character.only = TRUE))
+
+```
+
+```{r}
+# ============================
+# PANEL 2x2: MFA FINAL (elige cuál es tu "final": mfa_auto o mfa_fixed o mfa_classic)
+# ============================
+
+mfa_final  <- mfa_auto            # <- cambia a mfa_fixed o mfa_classic si ese es tu final
+meta_final <- meta_auto           # <- idem: meta_fixed / meta_classic
+prefix     <- "MFA_FINAL_panel_2x2"
+
+# 4 plots (asegura mismos parámetros que ya venías usando)
+p_scree  <- factoextra::fviz_screeplot(mfa_final, addlabels = TRUE)
+p_group  <- factoextra::fviz_mfa_group(mfa_final, repel = TRUE)
+p_var    <- fviz_mfa_ind(mfa_final, label = "none", habillage = as.factor(meta$respondent_group), addEllipses = TRUE, repel = TRUE)
+
+# individuos coloreados por DS (puedes cambiar a respondent_group/instrument si quieres)
+p_ind    <- factoextra::fviz_mfa_ind(
+  mfa_final,
+  label = "none",
+  habillage   = as.factor(meta_final$ds),
+  addEllipses = TRUE,
+  repel       = TRUE
+)
+
+# Panel 2x2 con etiquetas A–D
+panel <- ggpubr::ggarrange(
+  p_scree, p_group,
+  p_var,   p_ind,
+  ncol = 2, nrow = 2,
+  labels = c("A", "B", "C", "D"),
+  common.legend = FALSE
+)
+
+# Título opcional (se ve bien en paper)
+#panel <- ggpubr::annotate_figure(
+#  panel,
+#  bottom = ggpubr::text_grob("Final MFA: Scree Plot, Groups, Variables, and #Individuals", face = "bold", size = 14)
+#)
+
+# Guardado paper-ready:
+# - PDF vectorial (MEJOR para artículo)
+# - Tamaño típico (A4 apaisado) o similar
+pdf_out <- file.path("outputs", paste0(prefix, ".pdf"))
+ggplot2::ggsave(pdf_out, plot = panel, device = cairo_pdf, width = 11.69, height = 8.27)  # A4 landscape
+
+# Además (opcional) PNG 600 dpi por si la revista lo pide:
+png_out <- file.path("outputs", paste0(prefix, ".png"))
+ggplot2::ggsave(png_out, plot = panel, width = 11.69, height = 8.27, dpi = 600)
+
+cat("Guardado en:\n", pdf_out, "\n", png_out, "\n")
+
+```
+
+
+
+
+#####################################################################################
+#####################################################################################
+#####################################################################################
+
+```{r}
+build_famd_input_by_instrument <- function(survey_db, instrument_name,
+                                           drop_constant = TRUE,
+                                           min_rows = 5) {
+
+  # seleccionar hojas del instrumento
+  sel <- purrr::keep(survey_db, ~ .x$meta$instrument == instrument_name)
+  if (length(sel) == 0) return(NULL)
+
+  # unir datos
+  df_all <- purrr::map_dfr(sel, ~ .x$data)
+
+  # columnas base
+  id_col <- names(df_all)[1]
+  ds_col <- names(df_all)[2]
+
+  # ítems segmentados
+  seg_map <- sel[[1]]$seg_map
+  item_cols <- get_item_columns(df_all, seg_map)
+
+  if (length(item_cols) < 2) return(NULL)
+
+  # dataset mixto
+  df_mix <- df_all %>%
+    dplyr::select(
+      all_of(item_cols),
+      ds,
+      respondent_group
+    ) %>%
+    dplyr::mutate(
+      dplyr::across(all_of(item_cols),
+                    ~ suppressWarnings(as.numeric(as.character(.x)))),
+      ds = as.factor(ds),
+      respondent_group = as.factor(respondent_group)
+    )
+
+  # eliminar ítems constantes
+  if (drop_constant) {
+    v <- vapply(df_mix[item_cols], function(z) var(z, na.rm = TRUE), numeric(1))
+    keep_items <- names(v)[is.finite(v) & v > 0]
+    df_mix <- df_mix %>%
+      dplyr::select(all_of(keep_items), ds, respondent_group)
+  }
+
+  if (nrow(df_mix) < min_rows || ncol(df_mix) < 3) return(NULL)
+
+  df_mix
+}
+
+instruments <- c("CCI", "HxC", "TEI")
+
+run_famd <- function(df_mix, ncp = 5, graph = FALSE) {
+
+  FactoMineR::FAMD(
+    df_mix,
+    ncp = ncp,
+    graph = graph
+  )
+}
+
+famd_results <- purrr::map(instruments, function(inst) {
+
+  df_mix <- build_famd_input_by_instrument(survey_db, inst)
+
+  if (is.null(df_mix)) {
+    message("FAMD skipped for ", inst)
+    return(NULL)
+  }
+
+  res <- run_famd(df_mix, ncp = 5)
+
+  list(
+    instrument = inst,
+    data = df_mix,
+    res = res
+  )
+})
+
+names(famd_results) <- instruments
+
+```
+
+```{r}
+factoextra::fviz_famd_ind(
+  famd_results$CCI$res,
+  habillage = "respondent_group",
+  addEllipses = TRUE,
+  repel = TRUE
+)
+
+```
+
+```{r}
+factoextra::fviz_famd_ind(
+  famd_results$CCI$res,
+  habillage = "ds",
+  addEllipses = TRUE,
+  repel = TRUE
+)
+
+```
+
+```{r}
+factoextra::fviz_famd_var(
+  famd_results$CCI$res,
+  repel = TRUE
+)
+
+```
+
+```{r}
+factoextra::fviz_famd_ind(
+  famd_results$HxC$res,
+  habillage = "respondent_group",
+  addEllipses = TRUE,
+  repel = TRUE
+)
+
+```
+
+```{r}
+factoextra::fviz_famd_ind(
+  famd_results$HxC$res,
+  habillage = "ds",
+  addEllipses = TRUE,
+  repel = TRUE
+)
+
+```
+
+```{r}
+factoextra::fviz_famd_var(
+  famd_results$HxC$res,
+  repel = TRUE
+)
+
+```
+
+```{r}
+factoextra::fviz_famd_ind(
+  famd_results$TEI$res,
+  habillage = "respondent_group",
+  addEllipses = TRUE,
+  repel = TRUE
+)
+
+```
+
+```{r}
+factoextra::fviz_famd_ind(
+  famd_results$TEI$res,
+  habillage = "ds",
+  addEllipses = TRUE,
+  repel = TRUE
+)
+
+```
+
+```{r}
+factoextra::fviz_famd_var(
+  famd_results$TEI$res,
+  repel = TRUE
+)
+
+```
+
+```{r}
+# ============================================================
+# Journal-ready FAMD plots (cos2 + contributions)
+# ============================================================
+pkgs <- c("factoextra","FactoMineR","ggplot2","dplyr","stringr","tibble")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if(length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# ---------- A) Style helpers ----------
+theme_journal <- function(base_size = 12, base_family = "sans") {
+  ggplot2::theme_minimal(base_size = base_size, base_family = base_family) +
+    ggplot2::theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(linewidth = 0.25),
+      axis.title = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", size = base_size + 2),
+      plot.subtitle = element_text(size = base_size),
+      legend.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+}
+
+# Colorblind-friendly palette (Okabe-Ito)
+pal_okabe_ito <- c(
+  "#0072B2", "#D55E00", "#009E73", "#CC79A7",
+  "#E69F00", "#56B4E9", "#F0E442", "#000000"
+)
+
+# ---------- B) Main function: plots for one instrument ----------
+plot_famd_journal <- function(famd_res,
+                              instrument = "CCI",
+                              out_dir = "figures",
+                              dims = c(1,2),
+                              ellipse = TRUE,
+                              repel = TRUE,
+                              label_points = "none",  # "none" recommended for journal; or "all"
+                              dpi = 450) {
+
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # 1) Individuals: colored by respondent_group + cos2 as alpha/gradient
+  p_ind_grp <- factoextra::fviz_famd_ind(
+    famd_res,
+    axes = dims,
+    habillage = "respondent_group",
+    addEllipses = ellipse,
+    ellipse.level = 0.95,
+    repel = repel,
+    label = label_points
+  ) +
+    ggplot2::scale_color_manual(values = pal_okabe_ito) +
+    ggplot2::labs(
+      title = paste0("FAMD – Individuals (", instrument, ")"),
+      subtitle = "Color = respondent_group (Students vs Educators), ellipses = 95% CI"
+    ) +
+    theme_journal()
+
+  # 2) Individuals: quality (cos2) – shows which points are well represented on Dim1–Dim2
+  #    This is useful to justify interpretation in paper.
+  p_ind_cos2 <- factoextra::fviz_famd_ind(
+    famd_res,
+    axes = dims,
+    col.ind = "cos2",      # gradient
+    gradient.cols = c("#E6E6E6","#6BAED6","#2171B5","#08306B"),
+    repel = repel,
+    label = label_points
+  ) +
+    ggplot2::labs(
+      title = paste0("FAMD – Individuals quality (cos²) (", instrument, ")"),
+      subtitle = "Darker points = better represented on Dim1–Dim2"
+    ) +
+    theme_journal()
+
+  # 3) Variables: contributions (quant + qual displayed together in FAMD)
+  p_var_contrib <- factoextra::fviz_famd_var(
+    famd_res,
+    axes = dims,
+    col.var = "contrib",
+    gradient.cols = c("#F2F2F2","#FDBE85","#E6550D","#A63603"),
+    repel = TRUE
+  ) +
+    ggplot2::labs(
+      title = paste0("FAMD – Variables contribution (", instrument, ")"),
+      subtitle = "Darker variables contribute more to Dim1–Dim2"
+    ) +
+    theme_journal()
+
+  # 4) Save
+  ggsave(file.path(out_dir, paste0("FAMD_", instrument, "_ind_group.png")),
+         p_ind_grp, width = 7.2, height = 5.0, dpi = dpi, bg = "white")
+  ggsave(file.path(out_dir, paste0("FAMD_", instrument, "_ind_cos2.png")),
+         p_ind_cos2, width = 7.2, height = 5.0, dpi = dpi, bg = "white")
+  ggsave(file.path(out_dir, paste0("FAMD_", instrument, "_var_contrib.png")),
+         p_var_contrib, width = 7.2, height = 5.2, dpi = dpi, bg = "white")
+
+  list(ind_group = p_ind_grp, ind_cos2 = p_ind_cos2, var_contrib = p_var_contrib)
+}
+
+# ---------- C) Tables: Top contributors (Dim1/Dim2) ----------
+top_contrib_tables <- function(famd_res, top_n = 12) {
+
+  # Quantitative vars contributions (items)
+  q1 <- FactoMineR::dimdesc(famd_res, axes = 1:2, proba = 1)$Dim.1$quanti
+  q2 <- FactoMineR::dimdesc(famd_res, axes = 1:2, proba = 1)$Dim.2$quanti
+
+  # Robust fallback if dimdesc returns NULL (depending on data composition)
+  # Use internal contrib matrices
+  contrib_quanti <- tryCatch(famd_res$quanti.var$contrib, error = function(e) NULL)
+  contrib_quali  <- tryCatch(famd_res$quali.var$contrib,  error = function(e) NULL)
+
+  get_top <- function(mat, dim, top_n) {
+    if (is.null(mat)) return(tibble::tibble(variable = character(), contrib = numeric()))
+    tibble::tibble(variable = rownames(mat), contrib = mat[, dim]) %>%
+      dplyr::arrange(dplyr::desc(contrib)) %>%
+      dplyr::slice_head(n = top_n)
+  }
+
+  top_q_dim1 <- get_top(contrib_quanti, 1, top_n)
+  top_q_dim2 <- get_top(contrib_quanti, 2, top_n)
+  top_c_dim1 <- get_top(contrib_quali,  1, top_n)
+  top_c_dim2 <- get_top(contrib_quali,  2, top_n)
+
+  list(
+    quanti_dim1 = top_q_dim1,
+    quanti_dim2 = top_q_dim2,
+    quali_dim1  = top_c_dim1,
+    quali_dim2  = top_c_dim2
+  )
+}
+
+# ============================================================
+# RUN (example for CCI)
+# ============================================================
+# Pick your instrument result:
+# famd_results$CCI$res  OR famd_results$HxC$res  OR famd_results$TEI$res
+
+plots_CCI <- plot_famd_journal(
+  famd_res = famd_results$CCI$res,
+  instrument = "CCI",
+  out_dir = "figures",
+  dims = c(1,2),
+  ellipse = TRUE,
+  repel = TRUE,
+  label_points = "none",
+  dpi = 450
+)
+
+top_CCI <- top_contrib_tables(famd_results$CCI$res, top_n = 12)
+
+# Print tables in console (or knitr::kable in Rmd)
+top_CCI$quanti_dim1
+top_CCI$quanti_dim2
+top_CCI$quali_dim1
+top_CCI$quali_dim2
+
+```
+
+```{r}
+plots_HxC <- plot_famd_journal(famd_results$HxC$res, instrument="HxC")
+top_HxC   <- top_contrib_tables(famd_results$HxC$res)
+
+plots_TEI <- plot_famd_journal(famd_results$TEI$res, instrument="TEI")
+top_TEI   <- top_contrib_tables(famd_results$TEI$res)
+
+```
+
+```{r}
+plots_CCI
+
+```
+
+```{r}
+plots_HxC
+
+```
+
+```{r}
+plots_TEI
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

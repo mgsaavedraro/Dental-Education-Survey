@@ -1,0 +1,8 @@
+"block","n_items","pc_used","style","narrative"
+"Acceptance",6,2,"bidimensional marcada","Acceptance bidimensional marcada (PC2 aporta estructura relevante)."
+"Adoption",2,2,"bidimensional marcada","Adoption bidimensional marcada (PC2 aporta estructura relevante)."
+"Feasibility",10,2,"bidimensional marcada","Feasibility bidimensional marcada (PC2 aporta estructura relevante)."
+"Fidelity",12,2,"bidimensional suave","Fidelity bidimensional suave (PC2 aporta señal secundaria)."
+"Maintenance",2,1,"unidimensional","Maintenance unidimensional (PC1 captura casi toda la varianza intrabloque)."
+"Relevance",12,2,"bidimensional marcada","Relevance bidimensional marcada (PC2 aporta estructura relevante)."
+"TEI",7,2,"bidimensional marcada","TEI bidimensional marcada (PC2 aporta estructura relevante)."
