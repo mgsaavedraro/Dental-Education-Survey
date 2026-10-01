@@ -35,7 +35,7 @@ data/raw/   (not public)
 docs/       data_dictionary.xlsx, revision_note.md
 outputs/    figures/Figure1_final.(pdf|png); tables/*.xlsx
 session/    sessionInfo.txt
-archive/previous_analysis/   superseded script, RDS objects, outputs and figures
+archive/previous_analysis/   superseded analysis script, outputs and figures
 ```
 
 ## Requirements
@@ -47,7 +47,7 @@ rmarkdown, psych, FactoMineR, factoextra, missMDA, polycor, ggplot2, ggpubr, MAS
 
 1. Clone the repository and open `Dental-Education-Survey.Rproj`.
 2. `rmarkdown::render("analysis/CCI_Process_Evaluation_Final.Rmd")` (about 15 minutes; the bootstrap uses a fixed seed).
-3. Outputs are written to `analysis/`. Age and sex are not public, so the age/sex cells of Table 1 are not reproduced from the public files.
+3. Outputs are written to outputs/. Age and sex are not public, so the age/sex cells of Table 1 are not reproduced from the public files.
 
 ## Expected results
 
