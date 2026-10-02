@@ -2,3 +2,10 @@
 .Rhistory
 .RData
 .Ruserdata
+
+# Do not publish legacy RDS or raw study data
+Data/*.rds
+data/raw/*
+!data/raw/README.md
+# Restricted study-derived files — never publish
+restricted/
