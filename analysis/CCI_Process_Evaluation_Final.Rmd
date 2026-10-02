@@ -45,12 +45,15 @@ invisible(lapply(pkgs, library, character.only = TRUE))
 # (ii) a spreadsheet copy-down error in the four educator adoption/maintenance items (all 16 educators = educator 1).
 # Both objects are therefore rebuilt here directly from the original survey export (verbatim responses), keeping
 # EXACTLY the same structure (6 sheets; identical column names, labels and segment maps) so that every downstream
-# chunk of the original script runs unchanged. See ForensicAudit.Rmd for the evidence.
+# chunk of the original script runs unchanged. See docs/revision_note.md for the public revision record.
 # ============================================================
 set.seed(20260929)                                               # REVISION 2026: fixed seed (bootstrap section at the end)
-proj_dir <- tryCatch(normalizePath(dirname(knitr::current_input(dir = TRUE))), error = function(e) getwd())   # REVISION 2026: relative paths
-data_dir <- if (dir.exists(file.path(proj_dir, "data"))) file.path(proj_dir, "data") else file.path(proj_dir, "..", "data")   # project root or analysis/ subfolder
-rev_out <- if (basename(proj_dir) == "analysis") proj_dir else file.path(proj_dir, "analysis"); dir.create(rev_out, showWarnings = FALSE)
+# Repository root: this Rmd is stored in the analysis/ subdirectory
+analysis_dir <- normalizePath(dirname(knitr::current_input(dir = TRUE)), winslash = "/", mustWork = FALSE)
+proj_dir <- normalizePath(file.path(analysis_dir, ".."), winslash = "/", mustWork = FALSE)
+data_dir <- file.path(proj_dir, "data")
+restricted_out <- file.path(proj_dir, "restricted")
+dir.create(restricted_out, showWarnings = FALSE, recursive = TRUE)
 f_raw <- list.files(data_dir, pattern = "raw.?data.*\\.xlsx$", ignore.case = TRUE, full.names = TRUE, recursive = TRUE)
 pub_items <- file.path(data_dir, "processed", "CCI_final_participant_level_deidentified.csv"); pub_adh <- file.path(data_dir, "processed", "CCI_final_adherence_deidentified.csv")
 # REVISION 2026: two input modes. "raw" = the authors' raw workbook (verbatim responses; restricted, contains identifiers in other sheets);
@@ -176,14 +179,14 @@ stopifnot(nrow(PARTICIPANTS) == 76, sum(PARTICIPANTS$respondent_group == "Studen
 if (DATA_MODE == "raw") {
   PARTICIPANTS <- PARTICIPANTS %>% dplyr::arrange(dplyr::desc(respondent_group), as.integer(n)) %>% dplyr::group_by(respondent_group) %>%
     dplyr::mutate(participant_code = sprintf("%s%02d", ifelse(respondent_group == "Students", "S", "E"), dplyr::row_number())) %>% dplyr::ungroup()
-  dir.create(file.path(rev_out, "public"), showWarnings = FALSE); dir.create(file.path(rev_out, "restricted"), showWarnings = FALSE)
+  dir.create(file.path(data_dir, "processed"), showWarnings = FALSE, recursive = TRUE)
   utils::write.csv(PARTICIPANTS %>% dplyr::transmute(participant_code, respondent_group, dental_school = ds, dplyr::across(dplyr::all_of(raw_codes))),
-                   file.path(rev_out, "public", "CCI_final_participant_level_deidentified.csv"), row.names = FALSE)
+                   file.path(data_dir, "processed", "CCI_final_participant_level_deidentified.csv")
   code_of_student <- stats::setNames(PARTICIPANTS$participant_code[PARTICIPANTS$respondent_group == "Students"], PARTICIPANTS$n[PARTICIPANTS$respondent_group == "Students"])
   utils::write.csv(ADH_SRC %>% dplyr::filter(n_patients > 0) %>% dplyr::transmute(participant_code = unname(code_of_student[as.character(student)]), dental_school = ds, n_patients,
                    dohr_assessable = !not_completed, recall, fluoride, noc_active, monitor_inactive) %>% dplyr::arrange(participant_code),
-                   file.path(rev_out, "public", "CCI_final_adherence_deidentified.csv"), row.names = FALSE)
-  utils::write.csv(PARTICIPANTS %>% dplyr::transmute(participant_code, study_record_id = n, respondent_group), file.path(rev_out, "restricted", "participant_code_to_study_id_RESTRICTED.csv"), row.names = FALSE)
+                   file.path(data_dir, "processed", "CCI_final_adherence_deidentified.csv")
+  utils::write.csv(PARTICIPANTS %>% dplyr::transmute(participant_code, study_record_id = n, respondent_group), file.path(restricted_out, "participant_code_to_study_id_RESTRICTED.csv"), row.names = FALSE)
   stopifnot(!anyNA(code_of_student))
 }
 
@@ -217,9 +220,15 @@ DICTIONARY <- item_map %>% dplyr::transmute(variable = code, instrument = ifelse
                                   question = c("Participant code (S01-S60 students, E01-E16 educators; sequential)", "Study record identifier (an identifier, not a count; restricted)", "Record identifier in the raw export (restricted)", "Students / Educators", "DS1-DS7 (manuscript coding; institution identity confidential)", "Femenino / Masculino", "Years"),
                                   legacy_column_name = c("-", "N° (role-specific)", "N°", "respondent_group", "ds", "A3", "A4"), coding = "-", reverse_coded = "-"))
 stopifnot(nrow(FINAL_DB) == 76, !anyDuplicated(FINAL_DB$participant_id), ncol(FINAL_DB) == 7 + 51)
-saveRDS(FINAL_DB, file.path(rev_out, "FINAL_ANALYTIC_DATABASE.rds"))
-writexl::write_xlsx(list(FINAL_ANALYTIC_DATABASE = as.data.frame(FINAL_DB), DATA_DICTIONARY = as.data.frame(DICTIONARY)), file.path(rev_out, "FINAL_ANALYTIC_DATABASE.xlsx"))
-write.csv(DICTIONARY, file.path(rev_out, "DATA_DICTIONARY.csv"), row.names = FALSE)
+saveRDS(FINAL_DB, file.path(restricted_out, "FINAL_ANALYTIC_DATABASE.rds"))
+writexl::write_xlsx(
+  list(
+    FINAL_ANALYTIC_DATABASE = as.data.frame(FINAL_DB),
+    DATA_DICTIONARY = as.data.frame(DICTIONARY)
+  ),
+  file.path(restricted_out, "FINAL_ANALYTIC_DATABASE.xlsx")
+)
+write.csv(DICTIONARY, file.path(restricted_out, "DATA_DICTIONARY.csv"), row.names = FALSE)
 ```
 
 <!-- REVISION: original data-loading chunk (replaced by the chunk above), kept for traceability:
@@ -1701,7 +1710,7 @@ to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
 if(length(to_install)) install.packages(to_install)
 invisible(lapply(pkgs, library, character.only = TRUE))
 
-dir.create("outputs", showWarnings = FALSE)
+dir.create(file.path(proj_dir, "archive", "previous_analysis", "outputs"), showWarnings = FALSE, recursive = TRUE)
 
 # -----------------------------
 # Helpers: tablas + var Dim1/2
@@ -1714,14 +1723,18 @@ mfa_dim12 <- function(mfa){
 }
 
 save_table_csv <- function(df, filename){
-  path <- file.path("outputs", filename)
+  archive_outputs <- file.path(proj_dir, "archive", "previous_analysis", "outputs")
+  dir.create(archive_outputs, showWarnings = FALSE, recursive = TRUE)
+  path <- file.path(archive_outputs, filename)
   write.csv(df, path, row.names = FALSE)
   path
 }
 
 save_plot_pdf_png <- function(p, stem, w=10, h=7){
-  pdf_path <- file.path("outputs", paste0(stem, ".pdf"))
-  png_path <- file.path("outputs", paste0(stem, ".png"))
+  archive_outputs <- file.path(proj_dir, "archive", "previous_analysis", "outputs")
+  dir.create(archive_outputs, showWarnings = FALSE, recursive = TRUE)
+  pdf_path <- file.path(archive_outputs, paste0(stem, ".pdf"))
+  png_path <- file.path(archive_outputs, paste0(stem, ".png"))
   ggplot2::ggsave(pdf_path, plot = p, width = w, height = h, device = "pdf")
   ggplot2::ggsave(png_path, plot = p, width = w, height = h, dpi = 200)
   list(pdf = pdf_path, png = png_path)
@@ -2033,7 +2046,7 @@ show_pngs(files_classic, "Gráficos — MFA clásico")
 show_pngs(files_fixed,   "Gráficos — MFA policórico (2PC fijo por bloque)")
 show_pngs(files_auto,    "Gráficos — MFA policórico AUTO (1 vs 2 PCs por bloque)")
 
-cat("\n\n**Nota:** Todos los gráficos también están guardados en PDF dentro de la carpeta `outputs/`.\n")
+cat("\n\n**Nota:** Los gráficos de este análisis anterior se conservan para trazabilidad en `archive/previous_analysis/outputs/`.\n")
 
 ```
 
@@ -2086,11 +2099,14 @@ panel <- ggpubr::ggarrange(
 # Guardado paper-ready:
 # - PDF vectorial (MEJOR para artículo)
 # - Tamaño típico (A4 apaisado) o similar
-pdf_out <- file.path("outputs", paste0(prefix, ".pdf"))
-ggplot2::ggsave(pdf_out, plot = panel, device = cairo_pdf, width = 11.69, height = 8.27)  # A4 landscape
+archive_outputs <- file.path(proj_dir, "archive", "previous_analysis", "outputs")
+dir.create(archive_outputs, showWarnings = FALSE, recursive = TRUE)
+
+pdf_out <- file.path(archive_outputs, paste0(prefix, ".pdf"))
+ggplot2::ggsave(pdf_out, plot = panel, device = cairo_pdf, width = 11.69, height = 8.27)
 
 # Además (opcional) PNG 600 dpi por si la revista lo pide:
-png_out <- file.path("outputs", paste0(prefix, ".png"))
+png_out <- file.path(archive_outputs, paste0(prefix, ".png"))
 ggplot2::ggsave(png_out, plot = panel, width = 11.69, height = 8.27, dpi = 600)
 
 cat("Guardado en:\n", pdf_out, "\n", png_out, "\n")
@@ -2302,7 +2318,7 @@ pal_okabe_ito <- c(
 # ---------- B) Main function: plots for one instrument ----------
 plot_famd_journal <- function(famd_res,
                               instrument = "CCI",
-                              out_dir = "figures",
+                              out_dir = file.path(proj_dir, "archive", "previous_analysis", "figures"),
                               dims = c(1,2),
                               ellipse = TRUE,
                               repel = TRUE,
@@ -2410,7 +2426,7 @@ top_contrib_tables <- function(famd_res, top_n = 12) {
 plots_CCI <- plot_famd_journal(
   famd_res = famd_results$CCI$res,
   instrument = "CCI",
-  out_dir = "figures",
+  out_dir = file.path(proj_dir, "archive", "previous_analysis", "figures"),
   dims = c(1,2),
   ellipse = TRUE,
   repel = TRUE,
@@ -2621,26 +2637,44 @@ knitr::kable(AX_GROUPS, digits = 3); knitr::kable(AX_COMP, digits = 3); knitr::k
 
 ```{r rev-export}
 # REVISION 2026: exports used by the manuscript and response Rmds (no hand-typed numbers downstream)
-FIG_OUT <- c(pdf = file.path(rev_out, "Figure1_CORRECTED.pdf"), png = file.path(rev_out, "Figure1_CORRECTED.png"))
+fig_out <- file.path(proj_dir, "outputs", "figures")
+table_out <- file.path(proj_dir, "outputs", "tables")
+session_out <- file.path(proj_dir, "session")
+
+dir.create(fig_out, showWarnings = FALSE, recursive = TRUE)
+dir.create(table_out, showWarnings = FALSE, recursive = TRUE)
+dir.create(session_out, showWarnings = FALSE, recursive = TRUE)
+FIG_OUT <- c(
+  pdf = file.path(fig_out, "Figure1_final.pdf"),
+  png = file.path(fig_out, "Figure1_final.png")
+)
 ggplot2::ggsave(FIG_OUT[["pdf"]], plot = panel, device = cairo_pdf, width = 11.69, height = 8.27)
 ggplot2::ggsave(FIG_OUT[["png"]], plot = panel, width = 11.69, height = 8.27, dpi = 600, bg = "white")
 wbx <- function(lst, f) writexl::write_xlsx(lapply(lst, as.data.frame), f)   # REVISION 2026: clean OOXML writer
-wbx(list(BLOCK_RETENTION = BLOCKS), file.path(rev_out, "MFA_BLOCK_RETENTION.xlsx"))
+wbx(list(BLOCK_RETENTION = BLOCKS), file.path(table_out, "MFA_BLOCK_RETENTION.xlsx"))
 wbx(list(BLOCK_GROUPS = AX_GROUPS, COMPONENTS = AX_COMP, ITEMS = AX_ITEMS %>% dplyr::arrange(dplyr::desc(abs(rho_Dim1))), LABEL_TESTS = AX_TESTS,
          ORIENTATION = AX_ORIENT, GEOMETRY_ETA2 = AX_GEOM, BARYCENTRES = AX_BARY, EIGENVALUES = as.data.frame(mfa_auto$eig) %>% tibble::rownames_to_column("dim")),
-    file.path(rev_out, "MFA_AXIS_INTERPRETATION.xlsx"))
-wbx(list(SENSITIVITY = SENS, BOOTSTRAP = BOOT, CROSS_CHECK = XCHECK), file.path(rev_out, "MFA_SENSITIVITY.xlsx"))
+    file.path(table_out, "MFA_AXIS_INTERPRETATION.xlsx"))
+wbx(list(SENSITIVITY = SENS, BOOTSTRAP = BOOT, CROSS_CHECK = XCHECK), file.path(table_out, "MFA_SENSITIVITY.xlsx"))
 wbx(list(TABLE1_BY_DS = T1_ds, TABLE1_TOTALS = T1_tot, TABLE1_PER_DS = T1_perds, TABLE2 = T2, TABLE3_POOLED = T3_pooled, ITEMS = ITEMS,
-         ADHERENCE_FLOW = ADH_FLOW, ADHERENCE_CRITERIA = ADH_CRIT, CCI_VS_DOHR = INS_MEANS), file.path(rev_out, "CORRECTED_TABLES_DATA.xlsx"))
+         ADHERENCE_FLOW = ADH_FLOW, ADHERENCE_CRITERIA = ADH_CRIT, CCI_VS_DOHR = INS_MEANS), file.path(table_out, "CORRECTED_TABLES_DATA.xlsx"))
 saveRDS(list(T1_ds = T1_ds, T1_tot = T1_tot, T1_perds = T1_perds, T2 = T2, ITEMS = ITEMS, T3_pooled = T3_pooled, INS_MEANS = INS_MEANS,
              ADH = ADH, ADH_FLOW = ADH_FLOW, ADH_CRIT = ADH_CRIT, ADH_TOT = ADH_TOT, BLOCKS = BLOCKS, SENS = SENS, BOOT = BOOT, XCHECK = XCHECK,
              eig = mfa_auto$eig, eig_stu = mfa_stu$eig, eig_fixed = mfa_fixed$eig, eig_classic = mfa_classic$eig,
              AX_GROUPS = AX_GROUPS, AX_COMP = AX_COMP, AX_ITEMS = AX_ITEMS, AX_TESTS = AX_TESTS, AX_ORIENT = AX_ORIENT, AX_GEOM = AX_GEOM, AX_BARY = AX_BARY,
              n_zero_var = n_zero_var, n_students = sum(PARTICIPANTS$respondent_group == "Students"), n_educators = sum(PARTICIPANTS$respondent_group == "Educators"),
              item_map = item_map, alpha_segment = alpha_segment, boot_B = B, seed = 20260929),
-        file.path(rev_out, "analysis_results.rds"))
-writeLines(c(paste("Rendered:", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")), "Seed: 20260929", capture.output(sessionInfo())), file.path(rev_out, "SESSION_INFO.txt"))
-list.files(rev_out)
+        file.path(restricted_out, "analysis_results.rds"))
+writeLines(
+  c(
+    paste("Rendered:", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
+    "Seed: 20260929",
+    capture.output(sessionInfo())
+  ),
+  file.path(session_out, "sessionInfo.txt")
+)
+
+list.files(file.path(proj_dir, "outputs"), recursive = TRUE)
 ```
 
 ```{r rev-session}
